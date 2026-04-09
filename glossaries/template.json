@@ -1,0 +1,49 @@
+{
+  "work_id": "replace-me",
+  "source_file": "replace-me.txt",
+  "language_pair": {
+    "source": "ko",
+    "target": "en"
+  },
+  "global_instructions": [
+    "Preserve chapter order and paragraph breaks unless formatting is clearly broken.",
+    "Prefer consistent naming over literal variation across chapters.",
+    "Keep speech style stable for recurring characters.",
+    "Translate section headings naturally and omit decorative divider characters.",
+    "If a recurring interface or system voice appears, keep its wording and formatting consistent."
+  ],
+  "character_profiles": [
+    {
+      "source_name": "",
+      "target_name": "",
+      "role": "",
+      "speech_style_notes": "",
+      "personality_notes": "",
+      "status": "draft"
+    }
+  ],
+  "term_glossary": [
+    {
+      "source_term": "",
+      "target_term": "",
+      "category": "place|item|skill|organization|system|other",
+      "notes": "",
+      "status": "draft"
+    }
+  ],
+  "style_rules": [
+    {
+      "rule": "",
+      "reason": ""
+    },
+    {
+      "rule": "If the source withholds a character's name, preserve that ambiguity in English.",
+      "reason": "Avoid introducing certainty or identity information earlier than the source does."
+    }
+  ],
+  "do_not_translate": [""],
+  "review_notes": [""]
+}
+
+    "Confirm romanization policy for character and place names before full-run translation.",
+    "Decide how chapter titles, epilogues, and side stories should be rendered in English."

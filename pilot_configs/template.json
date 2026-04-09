@@ -1,0 +1,25 @@
+{
+  "work_id": "sample-work",
+  "run_name": "pilot-sample",
+  "preprocess_config": "configs/template.json",
+  "glossary_file": "glossaries/template.json",
+  "output_dir": "artifacts/sample-work/runs",
+  "model": {
+    "provider": "openai-chat-completions",
+    "model": "gpt-4.1-mini",
+    "base_url": "https://api.openai.com/v1/chat/completions",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0.2,
+    "max_output_tokens": 4000,
+    "timeout_seconds": 120
+  },
+  "translation": {
+    "source_language": "Korean",
+    "target_language": "English",
+    "max_chars_per_chunk": 4500
+  },
+  "selection": {
+    "kinds": ["chapter"],
+    "limit": 3
+  }
+}

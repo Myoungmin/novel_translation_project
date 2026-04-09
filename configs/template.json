@@ -1,0 +1,23 @@
+{
+  "work_id": "sample-work",
+  "source_file": "sources/sample_novel.txt",
+  "output_dir": "artifacts/sample-work",
+  "encodings": ["utf-8", "utf-8-sig", "cp949"],
+  "clean_exclude_types": ["afterword"],
+  "patterns": [
+    {
+      "name": "afterword",
+      "kind": "afterword",
+      "regex": "작품 후기",
+      "title_source": "literal",
+      "title_literal": "작품 후기"
+    },
+    {
+      "name": "five_digit_chapter",
+      "kind": "chapter",
+      "regex": "^\\d{5}\\s+.*={20,}$",
+      "title_source": "match",
+      "title_regex": "^(?P<number>\\d{5})\\s+(?P<title>.*?)\\s+=+$"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+.env.*
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Large local source novels
+sources/*.txt
+
+# Per-novel local configs (keep template examples only)
+configs/*.json
+pilot_configs/*.json
+!configs/template.json
+!pilot_configs/template.json
+
+# Per-novel glossary files (keep template example only)
+glossaries/*.json
+!glossaries/template.json
+
+# Generated preprocessing outputs
+artifacts/*/raw_split/
+artifacts/*/cleaned_split/
+artifacts/*/merged_clean.txt
+artifacts/*/manifests/
+
+# Generated translation run outputs
+artifacts/*/runs/
+artifacts/pilot-runs/
+artifacts/tmp-*/
