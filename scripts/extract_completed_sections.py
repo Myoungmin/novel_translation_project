@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import shutil
@@ -10,6 +11,7 @@ from typing import Any
 
 REQUEST_NAME_PATTERN = re.compile(r"^section-(\d+)-chunk-(\d+)\.(txt|json)$")
 MULTI_NEWLINE_PATTERN = re.compile(r"(\r?\n){2,}")
+INVALID_FILENAME_CHARS_PATTERN = re.compile(r'[<>:"/\\|?*]')
 
 
 def to_sorted_unique(items: list[int]) -> list[int]:
@@ -21,6 +23,90 @@ def normalize_blank_lines(text: str) -> str:
         return ""
     # Force every consecutive blank-line group to a single newline.
     return MULTI_NEWLINE_PATTERN.sub("\n", text)
+
+
+def sanitize_filename(value: str) -> str:
+    sanitized = INVALID_FILENAME_CHARS_PATTERN.sub("_", value).strip().rstrip(".")
+    return sanitized or "untitled"
+
+
+def infer_work_id_from_run_dir(run_dir: Path) -> str | None:
+    # Expected layout: artifacts/<work-id>/runs/<run-name>
+    if run_dir.parent.name != "runs":
+        return None
+    return run_dir.parent.parent.name
+
+
+def find_workspace_root(run_dir: Path) -> Path | None:
+    for candidate in [run_dir, *run_dir.parents]:
+        if (candidate / "configs").is_dir():
+            return candidate
+    return None
+
+
+def resolve_novel_title(run_dir: Path) -> str:
+    work_id = infer_work_id_from_run_dir(run_dir)
+    workspace_root = find_workspace_root(run_dir)
+    if not work_id or not workspace_root:
+        return "novel"
+
+    config_path = workspace_root / "configs" / f"{work_id}.json"
+    if not config_path.exists() or not config_path.is_file():
+        return work_id
+
+    try:
+        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return work_id
+
+    source_file = str(config_data.get("source_file", "")).strip()
+    if not source_file:
+        return work_id
+
+    return Path(source_file).stem.strip() or work_id
+
+
+def build_html_document(body_text: str) -> str:
+    escaped_text = html.escape(body_text)
+    return (
+        "<html>\n"
+        "<head>\n"
+        "<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "</head>\n"
+        "<body style=\"margin:0; background:#111; color:#eee; font-family:system-ui;\">\n"
+        "<div style=\"max-width:800px; margin:40px auto; padding:20px;\">\n"
+        "<pre style=\"font-size:20px; line-height:1.8; white-space:pre-wrap; word-break:break-word;\">\n"
+        f"{escaped_text}\n"
+        "</pre>\n"
+        "</div>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def write_html_output_for_range(
+    out_dir: Path,
+    run_dir: Path,
+    merged_file_name: str,
+    start_section: int,
+    end_section: int,
+) -> str | None:
+    merged_txt_path = out_dir / merged_file_name
+    if not merged_txt_path.exists() or not merged_txt_path.is_file():
+        return None
+
+    html_dir = out_dir / "html"
+    ensure_directory(html_dir)
+
+    novel_title = sanitize_filename(resolve_novel_title(run_dir))
+    html_name = f"{novel_title}_{start_section:04d}-{end_section:04d}.html"
+    html_path = html_dir / html_name
+
+    txt_content = merged_txt_path.read_text(encoding="utf-8")
+    html_content = build_html_document(txt_content)
+    html_path.write_text(html_content, encoding="utf-8")
+    return str(html_path.relative_to(out_dir))
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,6 +236,10 @@ def clean_output_artifacts(
     report_path = out_dir / "completed_sections_report.json"
     if report_path.exists() and report_path.is_file():
         report_path.unlink()
+
+    html_dir = out_dir / "html"
+    if html_dir.exists() and html_dir.is_dir():
+        shutil.rmtree(html_dir)
 
 
 def main() -> None:
@@ -312,6 +402,27 @@ def main() -> None:
             current_final_range = final_merged_range
             current_final_file = final_merged_file
 
+    html_output_files: list[str] = []
+    for merged_output_file in merged_output_files:
+        range_match = re.match(
+            r"^contiguous_completed_merged_(\d{4})-(\d{4})\.txt$",
+            merged_output_file,
+        )
+        if not range_match:
+            continue
+
+        start_section = int(range_match.group(1))
+        end_section = int(range_match.group(2))
+        html_output_file = write_html_output_for_range(
+            out_dir=out_dir,
+            run_dir=run_dir,
+            merged_file_name=merged_output_file,
+            start_section=start_section,
+            end_section=end_section,
+        )
+        if html_output_file:
+            html_output_files.append(html_output_file)
+
     report = {
         "run_dir": str(run_dir),
         "source_section_count": len(all_sections),
@@ -341,6 +452,8 @@ def main() -> None:
         "completed_section_files_written": completed_section_files,
         "final_merged_file": current_final_file,
         "final_merged_range": current_final_range,
+        "html_output_files": html_output_files,
+        "final_html_file": html_output_files[-1] if html_output_files else None,
         "sections": section_stats,
     }
 
@@ -360,6 +473,10 @@ def main() -> None:
         print(f"Cumulative merged file: {out_dir / current_final_file}")
     else:
         print("No cumulative merged file created (blocks not merged or not continuous)")
+    if html_output_files:
+        print(f"HTML files created: {len(html_output_files)}")
+        for html_output_file in html_output_files:
+            print(f"  - {out_dir / html_output_file}")
     print(f"Completed sections folder: {completed_sections_dir}")
     print(f"Report file: {report_path}")
 
