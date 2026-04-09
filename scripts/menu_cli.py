@@ -66,6 +66,35 @@ def list_config_files(directory: Path) -> list[Path]:
     return sorted(directory.glob("*.json"))
 
 
+def list_run_directories() -> list[Path]:
+    artifacts_root = PROJECT_ROOT / "artifacts"
+    if not artifacts_root.exists():
+        return []
+
+    run_dirs: list[Path] = []
+    for work_dir in artifacts_root.iterdir():
+        if not work_dir.is_dir():
+            continue
+        runs_dir = work_dir / "runs"
+        if not runs_dir.exists() or not runs_dir.is_dir():
+            continue
+        for run_dir in runs_dir.iterdir():
+            if run_dir.is_dir():
+                run_dirs.append(run_dir)
+
+    return sorted(run_dirs)
+
+
+def prompt_optional_int(prompt: str) -> int | None:
+    while True:
+        raw = input(prompt).strip()
+        if raw == "":
+            return None
+        if raw.isdigit():
+            return int(raw)
+        print("숫자 또는 빈 입력만 가능합니다.")
+
+
 def resolve_run_output_dir(payload: dict) -> Path | None:
     output_dir_value = payload.get("output_dir")
     run_name = payload.get("run_name")
@@ -215,6 +244,7 @@ def run_pilot(execute: bool) -> None:
     ]
     if execute:
         command.append("--execute")
+        command.append("--skip-final-translated")
         if confirm("기존 run_name 결과를 이어서 실행할까요?"):
             command.append("--resume")
             resume_requested = True
@@ -227,6 +257,30 @@ def run_pilot(execute: bool) -> None:
         print(f"\n파일럿 실행에 실패했습니다. 종료 코드: {return_code}")
 
 
+def run_extract_completed_sections() -> None:
+    run_dirs = list_run_directories()
+    selected_run_dir = choose_from_list("\n[완성 화 추출] run 폴더를 선택하세요.", run_dirs)
+    if selected_run_dir is None:
+        return
+
+    start_section = prompt_optional_int(
+        "합칠 시작 화를 입력하세요 (--start-section, 빈 입력 시 0번 블록부터 끝까지): "
+    )
+
+    command = [
+        "py",
+        "scripts\\extract_completed_sections.py",
+        str(selected_run_dir.relative_to(PROJECT_ROOT)).replace("/", "\\"),
+    ]
+
+    if start_section is not None:
+        command.extend(["--start-section", str(start_section)])
+
+    return_code = run_command(command)
+    if return_code != 0:
+        print(f"\n완성 화 추출 실행에 실패했습니다. 종료 코드: {return_code}")
+
+
 def main() -> None:
     while True:
         if should_clear_screen():
@@ -237,6 +291,7 @@ def main() -> None:
         print("1. 전처리 실행")
         print("2. 파일럿 드라이런 실행")
         print("3. 파일럿 실제 실행 (--execute)")
+        print("4. 완성 화 추출 + 연속 병합")
         print("0. 종료")
 
         choice = input("\n메뉴 번호를 입력하세요: ").strip()
@@ -249,6 +304,9 @@ def main() -> None:
             pause()
         elif choice == "3":
             run_pilot(execute=True)
+            pause()
+        elif choice == "4":
+            run_extract_completed_sections()
             pause()
         elif choice == "0":
             print("종료합니다.")

@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resume an existing execute run by skipping chunks with saved translations.",
     )
+    parser.add_argument(
+        "--skip-final-translated",
+        action="store_true",
+        help="Do not write final_translated.txt during execute.",
+    )
     return parser.parse_args()
 
 
@@ -857,6 +862,7 @@ def merge_translation_outputs(
     output_root: Path,
     selected_sections: list[dict[str, Any]],
     summary_requests: list[dict[str, Any]],
+    skip_final_translated: bool = False,
 ) -> dict[str, Any]:
     translation_dir = output_root / "translations"
     merged_sections_dir = output_root / "merged_sections"
@@ -908,7 +914,7 @@ def merge_translation_outputs(
         final_parts.append(merged_text.rstrip())
 
     final_translation_file = None
-    if final_parts:
+    if final_parts and not skip_final_translated:
         final_translation_file = "final_translated.txt"
         (output_root / final_translation_file).write_text(
             "\n\n".join(final_parts).strip() + "\n",
@@ -1199,7 +1205,12 @@ def main() -> None:
 
     if args.execute:
         summary["usage"] = summarize_usage(summary_requests)
-        summary["merge"] = merge_translation_outputs(output_root, selected_sections, summary_requests)
+        summary["merge"] = merge_translation_outputs(
+            output_root,
+            selected_sections,
+            summary_requests,
+            skip_final_translated=args.skip_final_translated,
+        )
         summary["qa"] = generate_qa_report(output_root, summary_requests, glossary)
 
     write_json(output_root / "run_summary.json", summary)

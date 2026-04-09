@@ -65,6 +65,9 @@ run-menu.cmd
 메뉴에서 전처리를 실행하면 완료 직후 raw_split/cleaned_split 파일 수와 파일명 샘플 5개를 자동으로 출력한다.
 메뉴에서 파일럿 실제 실행을 선택하면 API 키 입력값은 화면에 표시되지 않는다.
 파일럿 실제 실행 메뉴에서는 기존 run_name 결과를 이어서 실행할지(`--resume`) 선택할 수 있다.
+메뉴 3번 실행은 `final_translated.txt` 생성을 건너뛴다 (`--skip-final-translated`).
+메뉴 4번에서는 완성 화 추출 스크립트를 실행하며 `--start-section`만 선택할 수 있다.
+빈 입력 시 0번 블록부터 끝까지 재생성한다.
 
 ### 1) 전처리
 
@@ -102,6 +105,24 @@ py scripts\translate_pilot.py pilot_configs\my-work.claude.json --base-dir d:\no
 cd /d d:\novel_translation_project
 set GEMINI_API_KEY=YOUR_KEY
 py scripts\translate_pilot.py pilot_configs\my-work.gemini.json --base-dir d:\novel_translation_project --execute
+```
+
+### 6) 완성 화 추출 + 연속 구간 병합
+
+`source_chunks` 대비 번역 청크가 모두 존재하는 섹션만 완성 화로 판정한다.
+실행할 때마다 `postprocess_completed` 산출물을 깨끗하게 재생성한다.
+개별 연속 블록 파일(`contiguous_completed_merged_XXXX-YYYY.txt`)은 선택 범위 전체를 생성하고,
+최종 누적 파일은 화수가 실제로 이어지는 블록만 누적한다.
+
+```cmd
+cd /d d:\novel_translation_project
+py scripts\extract_completed_sections.py artifacts\my-work\runs\my-run
+```
+
+시작 화 지정 예시 (`start-section`이 포함된 블록은 건너뛰고 다음 블록부터 끝까지 생성):
+
+```cmd
+py scripts\extract_completed_sections.py artifacts\my-work\runs\my-run --start-section 121
 ```
 
 ## 출력 위치
