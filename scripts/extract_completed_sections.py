@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-REQUEST_NAME_PATTERN = re.compile(r"^section-(\d+)-chunk-(\d+)\.(txt|json)$")
+REQUEST_NAME_PATTERN = re.compile(r"^section-(.+)-chunk-(\d+)\.(txt|json)$")
 MULTI_NEWLINE_PATTERN = re.compile(r"(\r?\n){2,}")
 INVALID_FILENAME_CHARS_PATTERN = re.compile(r'[<>:"/\\|?*]')
 
@@ -33,7 +33,10 @@ def sanitize_filename(value: str) -> str:
 def infer_work_id_from_run_dir(run_dir: Path) -> str | None:
     # Expected layout: artifacts/<work-id>/runs/<run-name>
     if run_dir.parent.name != "runs":
-        return None
+        # Also support ad-hoc sample runs like artifacts/pilot-runs/<work-id>/<run-name>.
+        if run_dir.parent.parent.name != "pilot-runs":
+            return None
+        return run_dir.parent.name
     return run_dir.parent.parent.name
 
 
@@ -44,19 +47,105 @@ def find_workspace_root(run_dir: Path) -> Path | None:
     return None
 
 
-def resolve_novel_title(run_dir: Path) -> str:
+def resolve_work_config_path(run_dir: Path) -> tuple[Path | None, dict[str, Any] | None]:
     work_id = infer_work_id_from_run_dir(run_dir)
     workspace_root = find_workspace_root(run_dir)
     if not work_id or not workspace_root:
-        return "novel"
+        return None, None
 
     config_path = workspace_root / "configs" / f"{work_id}.json"
     if not config_path.exists() or not config_path.is_file():
-        return work_id
+        return None, None
 
     try:
-        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+        return config_path, json.loads(config_path.read_text(encoding="utf-8"))
     except Exception:
+        return config_path, None
+
+
+def resolve_preprocess_output_dir(run_dir: Path) -> Path | None:
+    config_path, config_data = resolve_work_config_path(run_dir)
+    if not config_path or not config_data:
+        return None
+
+    output_dir = str(config_data.get("output_dir", "")).strip()
+    if not output_dir:
+        return None
+
+    output_path = Path(output_dir)
+    if output_path.is_absolute():
+        return output_path
+
+    workspace_root = find_workspace_root(run_dir)
+    if not workspace_root:
+        return None
+    return (workspace_root / output_path).resolve()
+
+
+def load_section_metadata_map(run_dir: Path) -> dict[int, dict[str, Any]]:
+    preprocess_output_dir = resolve_preprocess_output_dir(run_dir)
+    if not preprocess_output_dir:
+        return {}
+
+    manifest_path = preprocess_output_dir / "manifests" / "sections.json"
+    if not manifest_path.exists() or not manifest_path.is_file():
+        return {}
+
+    try:
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    metadata_by_index: dict[int, dict[str, Any]] = {}
+    for section in manifest_data.get("sections", []):
+        try:
+            section_index = int(section.get("index"))
+        except (TypeError, ValueError):
+            continue
+        metadata_by_index[section_index] = section
+
+    return metadata_by_index
+
+
+def build_section_index_lookup(section_metadata_map: dict[int, dict[str, Any]]) -> dict[str, int]:
+    lookup: dict[str, int] = {}
+    for section_index, metadata in section_metadata_map.items():
+        lookup[str(section_index)] = section_index
+
+        stable_id = str(metadata.get("stable_id") or "").strip()
+        if not stable_id:
+            section_code = str(metadata.get("section_code") or "").strip()
+            stable_id = f"s-{section_code}" if section_code else f"i-{section_index:04d}"
+        lookup[stable_id] = section_index
+
+        section_code = str(metadata.get("section_code") or "").strip()
+        if section_code:
+            lookup[f"s-{section_code}"] = section_index
+
+    return lookup
+
+
+def build_completed_section_file_name(section_index: int, section_metadata: dict[str, Any] | None) -> str:
+    if not section_metadata:
+        return f"section-{section_index:04d}.txt"
+
+    stable_id = str(section_metadata.get("stable_id") or "").strip() or f"i-{section_index:04d}"
+    name_parts = [f"section-{stable_id}"]
+    title = str(section_metadata.get("title") or "").strip()
+
+    if title:
+        name_parts.append(sanitize_filename(title))
+
+    return "_".join(name_parts) + ".txt"
+
+
+def resolve_novel_title(run_dir: Path) -> str:
+    work_id = infer_work_id_from_run_dir(run_dir)
+    if not work_id:
+        return "novel"
+
+    _, config_data = resolve_work_config_path(run_dir)
+    if not config_data:
         return work_id
 
     source_file = str(config_data.get("source_file", "")).strip()
@@ -141,16 +230,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_request_name(name: str) -> tuple[int, int] | None:
+def parse_request_name(
+    name: str,
+    section_index_lookup: dict[str, int],
+    unresolved_tokens: set[str] | None = None,
+) -> tuple[int, int] | None:
     match = REQUEST_NAME_PATTERN.match(name)
     if not match:
         return None
-    section_index = int(match.group(1))
+
+    section_token = match.group(1)
     chunk_index = int(match.group(2))
+
+    try:
+        section_index = int(section_token)
+    except ValueError:
+        section_index = section_index_lookup.get(section_token, -1)
+
+        # Fallback parser so stable-id file names still work even when
+        # section metadata/manifest lookup is unavailable.
+        if section_index < 0:
+            stable_match = re.match(r"^i-(\d+)$", section_token)
+            if stable_match:
+                section_index = int(stable_match.group(1))
+
+    if section_index < 0:
+        if unresolved_tokens is not None:
+            unresolved_tokens.add(section_token)
+        return None
+
     return section_index, chunk_index
 
 
-def collect_chunks(directory: Path) -> dict[int, dict[int, Path]]:
+def collect_chunks(
+    directory: Path,
+    section_index_lookup: dict[str, int],
+    unresolved_tokens: set[str] | None = None,
+) -> dict[int, dict[int, Path]]:
     section_to_chunks: dict[int, dict[int, Path]] = {}
     if not directory.exists():
         return section_to_chunks
@@ -158,7 +274,7 @@ def collect_chunks(directory: Path) -> dict[int, dict[int, Path]]:
     for path in directory.iterdir():
         if not path.is_file():
             continue
-        parsed = parse_request_name(path.name)
+        parsed = parse_request_name(path.name, section_index_lookup, unresolved_tokens)
         if not parsed:
             continue
         section_index, chunk_index = parsed
@@ -258,8 +374,23 @@ def main() -> None:
     ensure_directory(out_dir)
     clean_output_artifacts(out_dir)
 
-    source_map = collect_chunks(source_dir)
-    translation_map = collect_chunks(translation_dir)
+    section_metadata_map = load_section_metadata_map(run_dir)
+    section_index_lookup = build_section_index_lookup(section_metadata_map)
+    unresolved_source_tokens: set[str] = set()
+    unresolved_translation_tokens: set[str] = set()
+    source_map = collect_chunks(source_dir, section_index_lookup, unresolved_source_tokens)
+    translation_map = collect_chunks(translation_dir, section_index_lookup, unresolved_translation_tokens)
+
+    unresolved_tokens = sorted(unresolved_source_tokens | unresolved_translation_tokens)
+    if unresolved_tokens:
+        print(
+            "Warning: some chunk file section tokens could not be resolved to section indices. "
+            "Check sections manifest and work config mapping."
+        )
+        for token in unresolved_tokens[:20]:
+            print(f"  - unresolved section token: {token}")
+        if len(unresolved_tokens) > 20:
+            print(f"  ... and {len(unresolved_tokens) - 20} more")
 
     section_stats: list[dict[str, Any]] = []
     completed_sections: list[int] = []
@@ -280,6 +411,10 @@ def main() -> None:
         section_stats.append(
             {
                 "section_index": section_index,
+                "section_code": section_metadata_map.get(section_index, {}).get("section_code"),
+                "stable_id": section_metadata_map.get(section_index, {}).get("stable_id"),
+                "display_label": section_metadata_map.get(section_index, {}).get("display_label"),
+                "section_title": section_metadata_map.get(section_index, {}).get("title"),
                 "source_chunk_count": len(source_chunk_ids),
                 "translated_chunk_count": len(translated_chunk_ids),
                 "missing_chunk_ids": missing_chunk_ids,
@@ -325,7 +460,10 @@ def main() -> None:
         section_text = build_section_text(translation_map[section_index])
         if not section_text:
             continue
-        file_name = f"section-{section_index:04d}.txt"
+        file_name = build_completed_section_file_name(
+            section_index,
+            section_metadata_map.get(section_index),
+        )
         (completed_sections_dir / file_name).write_text(section_text, encoding="utf-8")
         completed_section_files.append(file_name)
 
@@ -389,7 +527,13 @@ def main() -> None:
                 print(f"[Cumulative] Appended block [{block_index}] {merged_output_file}")
                 final_path.write_text(combined_text, encoding="utf-8")
             else:
-                combined_text = block_text
+                # The cumulative range was extended (new file name). Read the previous
+                # cumulative file's content and prepend it so no content is lost.
+                if old_final_file and (out_dir / old_final_file).exists():
+                    old_content = (out_dir / old_final_file).read_text(encoding="utf-8")
+                    combined_text = old_content.rstrip() + "\n" + block_text
+                else:
+                    combined_text = block_text
                 print(f"[Cumulative] Created new cumulative file with block [{block_index}] {merged_output_file}")
                 final_path.write_text(combined_text, encoding="utf-8")
 

@@ -16,6 +16,7 @@ class PatternSpec:
     regex: re.Pattern[str]
     title_source: str = "line"
     title_regex: re.Pattern[str] | None = None
+    section_code_regex: re.Pattern[str] | None = None
     title_literal: str | None = None
 
 
@@ -25,9 +26,11 @@ class Section:
     kind: str
     pattern_name: str | None
     section_code: str | None
+    stable_id: str
     start_line: int
     end_line: int
     title: str
+    display_label: str
     header_line: str
     keep_in_clean: bool
     content: str
@@ -61,6 +64,7 @@ def compile_patterns(raw_patterns: list[dict[str, Any]]) -> list[PatternSpec]:
     compiled: list[PatternSpec] = []
     for raw_pattern in raw_patterns:
         title_regex = raw_pattern.get("title_regex")
+        section_code_regex = raw_pattern.get("section_code_regex")
         compiled.append(
             PatternSpec(
                 name=raw_pattern["name"],
@@ -68,10 +72,47 @@ def compile_patterns(raw_patterns: list[dict[str, Any]]) -> list[PatternSpec]:
                 regex=re.compile(raw_pattern["regex"]),
                 title_source=raw_pattern.get("title_source", "line"),
                 title_regex=re.compile(title_regex) if title_regex else None,
+                section_code_regex=(
+                    re.compile(section_code_regex)
+                    if section_code_regex
+                    else (re.compile(title_regex) if title_regex else None)
+                ),
                 title_literal=raw_pattern.get("title_literal"),
             )
         )
     return compiled
+
+
+def normalize_section_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized:
+        return None
+
+    if normalized.isdigit():
+        return normalized.zfill(5)
+
+    return normalized
+
+
+def build_stable_id(section_index: int, section_code: str | None) -> str:
+    if section_code:
+        return f"s-{section_code}"
+    return f"i-{section_index:04d}"
+
+
+def build_display_label(
+    section_index: int,
+    title: str,
+    section_code: str | None,
+) -> str:
+    if section_code and title:
+        return f"{section_code} {title}".strip()
+    if title:
+        return title
+    return f"section-{section_index:04d}"
 
 
 def read_source_text(source_path: Path, encodings: list[str]) -> tuple[str, str]:
@@ -126,15 +167,15 @@ def extract_title(
 
 
 def extract_section_code(pattern: PatternSpec | None, header_line: str) -> str | None:
-    if pattern is None or pattern.title_regex is None:
+    if pattern is None or pattern.section_code_regex is None:
         return None
 
-    match = pattern.title_regex.search(header_line)
+    match = pattern.section_code_regex.search(header_line)
     if not match:
         return None
 
     section_code = match.groupdict().get("number")
-    return section_code.strip() if section_code else None
+    return normalize_section_code(section_code) if section_code else None
 
 
 def cleanup_title(value: str) -> str:
@@ -162,6 +203,8 @@ def finalize_section(
         fallback_title,
     )
     section_code = extract_section_code(current["pattern"], current["header_line"])
+    stable_id = build_stable_id(current["index"], section_code)
+    display_label = build_display_label(current["index"], title, section_code)
     normalized_code = re.sub(r"[^0-9a-zA-Z]+", "-", section_code or "").strip("-").lower()
     if normalized_code:
         file_name = f"{current['index']:04d}_{current['kind']}_{normalized_code}.txt"
@@ -173,9 +216,11 @@ def finalize_section(
             kind=current["kind"],
             pattern_name=current["pattern"].name if current["pattern"] else None,
             section_code=section_code,
+            stable_id=stable_id,
             start_line=current["start_line"],
             end_line=current["end_line"],
             title=title,
+            display_label=display_label,
             header_line=current["header_line"],
             keep_in_clean=current["kind"] not in clean_exclude_types,
             content=content,
@@ -270,17 +315,21 @@ def write_outputs(
 
     merged_clean_parts: list[str] = []
     manifest_sections: list[dict[str, Any]] = []
+    ordinal_in_clean = 0
 
     for section in sections:
         raw_path = raw_dir / section.file_name
         raw_path.write_text(section.content, encoding="utf-8")
 
         clean_file: str | None = None
+        section_ordinal_in_clean: int | None = None
         if section.keep_in_clean:
             clean_path = clean_dir / section.file_name
             clean_path.write_text(section.content, encoding="utf-8")
             merged_clean_parts.append(section.content)
             clean_file = clean_path.name
+            ordinal_in_clean += 1
+            section_ordinal_in_clean = ordinal_in_clean
 
         manifest_sections.append(
             {
@@ -288,6 +337,9 @@ def write_outputs(
                 "kind": section.kind,
                 "pattern_name": section.pattern_name,
                 "section_code": section.section_code,
+                "stable_id": section.stable_id,
+                "display_label": section.display_label,
+                "ordinal_in_clean": section_ordinal_in_clean,
                 "title": section.title,
                 "header_line": section.header_line,
                 "start_line": section.start_line,

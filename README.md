@@ -83,6 +83,13 @@ cd /d d:\novel_translation_project
 py scripts\translate_pilot.py pilot_configs\my-work.json --base-dir d:\novel_translation_project
 ```
 
+파일럿 run의 요청/청크 파일명은 내부 section index 대신 안정 식별자 `stable_id`를 우선 사용한다.
+
+- section_code가 있으면: `section-s-00005-chunk-001.txt`
+- section_code가 없으면: `section-i-0837-chunk-001.txt`
+
+`run_summary.json`에는 `legacy_request_id`도 같이 기록하므로 기존 index 기반 run과 병행 검토할 수 있다.
+
 ### 3) 실행 (OpenAI)
 
 ```cmd
@@ -138,6 +145,14 @@ py scripts\extract_completed_sections.py artifacts\my-work\runs\my-run --start-s
 - `qa_report.json` - 길이/용어/이름 기준 QA 리포트
 - `run_summary.json` - 요청별 상태, 실패 목록, usage, 비용 추정 집계
 
+전처리 manifest(`artifacts/<work-id>/manifests/sections.json`) 주요 필드:
+
+- `index` - 내부 분할 순번
+- `section_code` - 실제 화수 코드가 있으면 기록
+- `stable_id` - 파이프라인 전반에서 쓰는 안정 식별자 (`s-00005`, `i-0837` 형식)
+- `display_label` - 사람이 읽는 표시 이름
+- `ordinal_in_clean` - `keep_in_clean` 기준 연속 순번
+
 전처리 분할 파일명 규칙:
 
 - 기본: `NNNN_kind.txt`
@@ -156,4 +171,5 @@ py scripts\extract_completed_sections.py artifacts\my-work\runs\my-run --start-s
 - `model.retry` 설정으로 재시도 정책을 조정할 수 있다.
 - `execution.max_workers` 값을 2 이상으로 두면 API 호출을 병렬 실행한다.
 - `selection.offset` 으로 선택된 섹션 목록의 시작 위치를 이동할 수 있다 (`limit: 1`과 함께 사용하면 한 번에 다른 섹션 1개씩 테스트 가능).
+- `selection.stable_ids` 로 특정 안정 식별자만 직접 선택할 수 있다.
 - `model.pricing.input_cost_per_million_tokens`, `model.pricing.output_cost_per_million_tokens` 를 넣으면 비용 추정이 계산된다.

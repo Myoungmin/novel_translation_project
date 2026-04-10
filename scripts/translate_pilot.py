@@ -68,6 +68,23 @@ def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def sanitize_filename(value: str) -> str:
+    sanitized = re.sub(r'[<>:"/\\|?*]', "_", value).strip().rstrip(".")
+    return sanitized or "untitled"
+
+
+def get_section_stable_id(section: dict[str, Any]) -> str:
+    stable_id = str(section.get("stable_id") or "").strip()
+    if stable_id:
+        return stable_id
+
+    section_code = str(section.get("section_code") or "").strip()
+    if section_code:
+        return f"s-{section_code}"
+
+    return f"i-{int(section['index']):04d}"
+
+
 def reset_output_directory(path: Path, safety_root: Path) -> None:
     resolved_path = path.resolve()
     resolved_root = safety_root.resolve()
@@ -103,7 +120,22 @@ def select_sections(
         selected = [
             section for section in selected if str(section.get("section_code") or "") in codes
         ]
-        
+
+    stable_ids = selection.get("stable_ids")
+    if stable_ids:
+        if not isinstance(stable_ids, list):
+            raise ValueError(
+                f"selection.stable_ids must be a list, got {type(stable_ids).__name__}"
+            )
+        allowed_stable_ids = {
+            str(stable_id).strip()
+            for stable_id in stable_ids
+            if str(stable_id).strip()
+        }
+        selected = [
+            section for section in selected if get_section_stable_id(section) in allowed_stable_ids
+        ]
+
     offset = selection.get("offset", 0)
     if isinstance(offset, int) and offset > 0:
         selected = selected[offset:]
@@ -113,6 +145,51 @@ def select_sections(
         selected = selected[:limit]
 
     return selected
+
+
+
+def build_request_id(section: dict[str, Any], chunk_index: int) -> str:
+    return f"section-{get_section_stable_id(section)}-chunk-{chunk_index:03d}"
+
+
+def build_legacy_request_id(section: dict[str, Any], chunk_index: int) -> str:
+    return f"section-{int(section['index']):04d}-chunk-{chunk_index:03d}"
+
+
+def build_merged_section_file_name(section: dict[str, Any]) -> str:
+    stable_id = get_section_stable_id(section)
+    title = str(section.get("title") or "").strip()
+    if title:
+        return f"section-{stable_id}_{sanitize_filename(title)}.txt"
+    return f"section-{stable_id}.txt"
+
+
+def has_legacy_only_request_artifacts(
+    prompts_dir: Path,
+    request_dir: Path,
+    source_dir: Path,
+    translation_dir: Path | None,
+    request_id: str,
+    legacy_request_id: str,
+) -> bool:
+    stable_paths = [
+        prompts_dir / f"{request_id}.json",
+        request_dir / f"{request_id}.json",
+        source_dir / f"{request_id}.txt",
+    ]
+    legacy_paths = [
+        prompts_dir / f"{legacy_request_id}.json",
+        request_dir / f"{legacy_request_id}.json",
+        source_dir / f"{legacy_request_id}.txt",
+    ]
+
+    if translation_dir is not None:
+        stable_paths.append(translation_dir / f"{request_id}.txt")
+        legacy_paths.append(translation_dir / f"{legacy_request_id}.txt")
+
+    return all(path.exists() for path in legacy_paths) and not any(
+        path.exists() for path in stable_paths
+    )
 
 
 def split_into_chunks(text: str, max_chars_per_chunk: int) -> list[Chunk]:
@@ -804,6 +881,12 @@ def generate_qa_report(
 
         translation_path = translation_dir / translation_file
         source_path = source_dir / f"{request_id}.txt"
+        if not source_path.exists():
+            legacy_request_id = item.get("legacy_request_id")
+            if legacy_request_id:
+                legacy_source_path = source_dir / f"{legacy_request_id}.txt"
+                if legacy_source_path.exists():
+                    source_path = legacy_source_path
         if not translation_path.exists() or not source_path.exists():
             continue
 
@@ -900,12 +983,14 @@ def merge_translation_outputs(
             continue
 
         merged_text = "\n\n".join(chunk_texts).strip() + "\n"
-        merged_file = f"section-{section['index']:04d}.txt"
+        merged_file = build_merged_section_file_name(section)
         (merged_sections_dir / merged_file).write_text(merged_text, encoding="utf-8")
         merged_sections.append(
             {
                 "section_index": section["index"],
                 "section_code": section.get("section_code"),
+                "stable_id": get_section_stable_id(section),
+                "display_label": section.get("display_label"),
                 "section_title": section.get("title"),
                 "merged_file": merged_file,
                 "chunk_count": len(chunk_texts),
@@ -1025,15 +1110,17 @@ def main() -> None:
             system_prompt = build_system_prompt(filtered_glossary, config["translation"])
             user_prompt = build_user_prompt(section, chunk, config["translation"])
 
-            request_id = (
-                f"section-{section['index']:04d}-chunk-{chunk.chunk_index:03d}"
-            )
+            request_id = build_request_id(section, chunk.chunk_index)
+            legacy_request_id = build_legacy_request_id(section, chunk.chunk_index)
             prompt_payload = {
                 "request_id": request_id,
+                "legacy_request_id": legacy_request_id,
                 "section": {
                     "index": section["index"],
                     "kind": section["kind"],
                     "section_code": section.get("section_code"),
+                    "stable_id": get_section_stable_id(section),
+                    "display_label": section.get("display_label"),
                     "title": section.get("title"),
                     "clean_file": clean_file,
                 },
@@ -1046,12 +1133,27 @@ def main() -> None:
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
             }
-            write_json(prompts_dir / f"{request_id}.json", prompt_payload)
+            # When resuming an un-migrated run (legacy translation exists but stable_id
+            # translation does not), skip writing stable_id-named files to avoid
+            # creating duplicates alongside the existing legacy-named files.
+            _has_legacy_only = args.resume and args.execute and has_legacy_only_request_artifacts(
+                prompts_dir,
+                request_dir,
+                source_dir,
+                translation_dir if args.execute else None,
+                request_id,
+                legacy_request_id,
+            )
+            if not _has_legacy_only:
+                write_json(prompts_dir / f"{request_id}.json", prompt_payload)
 
             request_payload = {
                 "request_id": request_id,
+                "legacy_request_id": legacy_request_id,
                 "provider": get_provider(config["model"]),
                 "model": config["model"]["model"],
+                "stable_id": get_section_stable_id(section),
+                "display_label": section.get("display_label"),
                 "base_url": config["model"]["base_url"],
                 "temperature": config["model"].get("temperature", 0.2),
                 "max_output_tokens": config["model"].get("max_output_tokens"),
@@ -1061,13 +1163,17 @@ def main() -> None:
                     user_prompt,
                 ),
             }
-            write_json(request_dir / f"{request_id}.json", request_payload)
-            (source_dir / f"{request_id}.txt").write_text(chunk.text, encoding="utf-8")
+            if not _has_legacy_only:
+                write_json(request_dir / f"{request_id}.json", request_payload)
+                (source_dir / f"{request_id}.txt").write_text(chunk.text, encoding="utf-8")
 
             request_summary = {
                 "request_id": request_id,
+                "legacy_request_id": legacy_request_id,
                 "section_index": section["index"],
                 "section_code": section.get("section_code"),
+                "stable_id": get_section_stable_id(section),
+                "display_label": section.get("display_label"),
                 "section_title": section.get("title"),
                 "chunk_index": chunk.chunk_index,
                 "character_count": len(chunk.text),
@@ -1076,6 +1182,8 @@ def main() -> None:
             if args.execute:
                 translation_file_name = f"{request_id}.txt"
                 translation_path = translation_dir / translation_file_name
+                legacy_translation_file_name = f"{legacy_request_id}.txt"
+                legacy_translation_path = translation_dir / legacy_translation_file_name
                 response_path = response_dir / f"{request_id}.json"
                 if args.resume and translation_path.exists():
                     request_summary["translation_file"] = translation_file_name
@@ -1083,6 +1191,14 @@ def main() -> None:
                     if previous_summary:
                         for item in previous_summary.get("requests", []):
                             if item.get("request_id") == request_id and item.get("attempts"):
+                                request_summary["attempts"] = item["attempts"]
+                                break
+                elif args.resume and legacy_translation_path.exists():
+                    request_summary["translation_file"] = legacy_translation_file_name
+                    request_summary["status"] = "skipped_existing"
+                    if previous_summary:
+                        for item in previous_summary.get("requests", []):
+                            if item.get("request_id") in {request_id, legacy_request_id} and item.get("attempts"):
                                 request_summary["attempts"] = item["attempts"]
                                 break
                 else:
