@@ -82,6 +82,54 @@ def resolve_preprocess_output_dir(run_dir: Path) -> Path | None:
     return (workspace_root / output_path).resolve()
 
 
+def resolve_html_split_size(run_dir: Path) -> int | None:
+    """
+    config에서 HTML 분할 크기를 읽습니다.
+    
+    html_output.split_size 설정:
+    - 숫자: 그 숫자 그대로 글자 수 (예: 30000)
+    - 프리셋: "light"(15000) / "medium"(30000) / "heavy"(50000)
+    - 미설정이나 0: 분할 없음
+    
+    Returns: 분할 크기 (글자), 또는 None (분할 안 함)
+    """
+    _, config_data = resolve_work_config_path(run_dir)
+    if not config_data:
+        return None
+    
+    html_config = config_data.get("html_output", {})
+    if not isinstance(html_config, dict):
+        return None
+    
+    # enabled가 False면 분할 안 함
+    if html_config.get("enabled") is False:
+        return None
+    
+    split_value = html_config.get("split_size")
+    if split_value is None:
+        return None
+    
+    # 프리셋 처리
+    presets: dict[str, int] = {
+        "light": 15000,
+        "medium": 30000,
+        "heavy": 50000,
+    }
+    
+    if isinstance(split_value, str) and split_value.lower() in presets:
+        return presets[split_value.lower()]
+    
+    # 숫자 처리
+    try:
+        split_size = int(split_value)
+        if split_size > 0:
+            return split_size
+    except (TypeError, ValueError):
+        pass
+    
+    return None
+
+
 def load_section_metadata_map(run_dir: Path) -> dict[int, dict[str, Any]]:
     preprocess_output_dir = resolve_preprocess_output_dir(run_dir)
     if not preprocess_output_dir:
@@ -174,28 +222,104 @@ def build_html_document(body_text: str) -> str:
     )
 
 
+def split_text_by_size(text: str, max_size: int) -> list[str]:
+    """텍스트를 최대 크기 기준으로 분할합니다. 최대한 문단 경계에서 분할하려고 시도합니다."""
+    if max_size <= 0:
+        return [text]
+    
+    if len(text) <= max_size:
+        return [text]
+    
+    parts: list[str] = []
+    current_pos = 0
+    
+    while current_pos < len(text):
+        # 현재 위치에서 max_size만큼 떨어진 위치까지의 텍스트
+        chunk_end = current_pos + max_size
+        
+        if chunk_end >= len(text):
+            # 남은 텍스트가 max_size 이하면 그냥 추가
+            parts.append(text[current_pos:])
+            break
+        
+        # max_size 지점 근처에서 줄바꿈을 찾아서 분할점 조정
+        split_point = chunk_end
+        
+        # 뒤쪽에서 줄바꿈 찾기 (최대 5000글자 범위)
+        search_start = max(current_pos, chunk_end - 5000)
+        last_newline = text.rfind('\n', search_start, chunk_end)
+        
+        if last_newline > current_pos:
+            split_point = last_newline + 1
+        else:
+            # 줄바꿈이 없으면 앞쪽에서 찾기
+            next_newline = text.find('\n', chunk_end)
+            if next_newline > 0 and next_newline - chunk_end < 1000:
+                split_point = next_newline + 1
+        
+        parts.append(text[current_pos:split_point])
+        current_pos = split_point
+    
+    return [p for p in parts if p.strip()]  # 빈 부분 제거
+
+
 def write_html_output_for_range(
     out_dir: Path,
     run_dir: Path,
     merged_file_name: str,
     start_section: int,
     end_section: int,
-) -> str | None:
+    split_size_chars: int | None = None,
+) -> list[str]:
+    """
+    병합된 txt 파일을 HTML로 변환하여 저장합니다.
+    split_size_chars가 설정되어 있으면 여러 개의 HTML 파일로 분할합니다.
+    
+    Returns: 생성된 HTML 파일 목록 (out_dir 기준 상대 경로)
+    """
     merged_txt_path = out_dir / merged_file_name
     if not merged_txt_path.exists() or not merged_txt_path.is_file():
-        return None
+        return []
 
     html_dir = out_dir / "html"
     ensure_directory(html_dir)
 
     novel_title = sanitize_filename(resolve_novel_title(run_dir))
-    html_name = f"{novel_title}_{start_section:04d}-{end_section:04d}.html"
-    html_path = html_dir / html_name
-
     txt_content = merged_txt_path.read_text(encoding="utf-8")
-    html_content = build_html_document(txt_content)
-    html_path.write_text(html_content, encoding="utf-8")
-    return str(html_path.relative_to(out_dir))
+    
+    # split_size_chars이 설정되지 않았거나 0 이하면 분할 안 함
+    if not split_size_chars or split_size_chars <= 0:
+        html_name = f"{novel_title}_{start_section:04d}-{end_section:04d}.html"
+        html_path = html_dir / html_name
+        html_content = build_html_document(txt_content)
+        html_path.write_text(html_content, encoding="utf-8")
+        return [str(html_path.relative_to(out_dir))]
+    
+    # 분할 로직: split_size_chars 기준으로 분할
+    text_parts = split_text_by_size(txt_content, split_size_chars)
+    
+    if len(text_parts) == 1:
+        # 분할이 불필요한 경우 (텍스트가 max_size 이하)
+        html_name = f"{novel_title}_{start_section:04d}-{end_section:04d}.html"
+        html_path = html_dir / html_name
+        html_content = build_html_document(text_parts[0])
+        html_path.write_text(html_content, encoding="utf-8")
+        return [str(html_path.relative_to(out_dir))]
+    
+    # 여러 파일로 분할하는 경우에는 전체 섹션 범위는 유지하고 part 번호만 붙입니다.
+    generated_files: list[str] = []
+    part_count = len(text_parts)
+    for part_index, part_text in enumerate(text_parts, start=1):
+        html_name = (
+            f"{novel_title}_{start_section:04d}-{end_section:04d}"
+            f"_part-{part_index:02d}-of-{part_count:02d}.html"
+        )
+        html_path = html_dir / html_name
+        html_content = build_html_document(part_text)
+        html_path.write_text(html_content, encoding="utf-8")
+        generated_files.append(str(html_path.relative_to(out_dir)))
+    
+    return generated_files
 
 
 def parse_args() -> argparse.Namespace:
@@ -546,6 +670,13 @@ def main() -> None:
             current_final_range = final_merged_range
             current_final_file = final_merged_file
 
+    # config에서 HTML 분할 설정 읽기
+    html_split_size = resolve_html_split_size(run_dir)
+    if html_split_size:
+        print(f"[HTML Output] Splitting enabled: {html_split_size} characters per file")
+    else:
+        print(f"[HTML Output] Splitting disabled: creating single files per merged range")
+
     html_output_files: list[str] = []
     for merged_output_file in merged_output_files:
         range_match = re.match(
@@ -557,15 +688,15 @@ def main() -> None:
 
         start_section = int(range_match.group(1))
         end_section = int(range_match.group(2))
-        html_output_file = write_html_output_for_range(
+        generated_html_files = write_html_output_for_range(
             out_dir=out_dir,
             run_dir=run_dir,
             merged_file_name=merged_output_file,
             start_section=start_section,
             end_section=end_section,
+            split_size_chars=html_split_size,
         )
-        if html_output_file:
-            html_output_files.append(html_output_file)
+        html_output_files.extend(generated_html_files)
 
     report = {
         "run_dir": str(run_dir),
