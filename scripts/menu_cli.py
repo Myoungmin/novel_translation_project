@@ -25,14 +25,15 @@ def should_clear_screen() -> bool:
     return os.getenv("MENU_CLEAR_SCREEN", "0") == "1"
 
 
-def choose_from_list(title: str, options: list[Path]) -> Path | None:
+def choose_from_list(title: str, options: list[Path], display_names: list[str] | None = None) -> Path | None:
     if not options:
         print("선택 가능한 항목이 없습니다.")
         return None
 
     print(title)
     for index, option in enumerate(options, start=1):
-        print(f"{index}. {option.name}")
+        display_text = display_names[index - 1] if display_names else option.name
+        print(f"{index}. {display_text}")
     print("0. 취소")
 
     while True:
@@ -83,6 +84,17 @@ def list_run_directories() -> list[Path]:
                 run_dirs.append(run_dir)
 
     return sorted(run_dirs)
+
+
+def get_run_directory_display_names(run_dirs: list[Path]) -> list[str]:
+    """Generate display names for run directories showing system and run folder names."""
+    display_names: list[str] = []
+    for run_dir in run_dirs:
+        # Get the system name (parent of runs directory)
+        system_name = run_dir.parent.parent.name
+        run_name = run_dir.name
+        display_names.append(f"{system_name} / {run_name}")
+    return display_names
 
 
 def prompt_optional_int(prompt: str) -> int | None:
@@ -259,7 +271,8 @@ def run_pilot(execute: bool) -> None:
 
 def run_extract_completed_sections() -> None:
     run_dirs = list_run_directories()
-    selected_run_dir = choose_from_list("\n[완성 화 추출] run 폴더를 선택하세요.", run_dirs)
+    display_names = get_run_directory_display_names(run_dirs)
+    selected_run_dir = choose_from_list("\n[완성 화 추출] run 폴더를 선택하세요.", run_dirs, display_names)
     if selected_run_dir is None:
         return
 
