@@ -2,14 +2,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+from datetime import datetime
 from getpass import getpass
 from pathlib import Path
+from typing import Any
+
+try:
+    from scripts.translate_pilot import call_model_api_with_retry
+    from scripts.translate_pilot import extract_translation_text
+    from scripts.translate_pilot import get_provider
+except ModuleNotFoundError:
+    # Allow running as `py scripts\menu_cli.py` where `scripts` is not a package import root.
+    from translate_pilot import call_model_api_with_retry
+    from translate_pilot import extract_translation_text
+    from translate_pilot import get_provider
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "configs"
 PILOT_CONFIG_DIR = PROJECT_ROOT / "pilot_configs"
+GLOSSARY_DIR = PROJECT_ROOT / "glossaries"
 
 
 def pause() -> None:
@@ -63,8 +77,176 @@ def run_command(command: list[str], env: dict[str, str] | None = None) -> int:
     return completed.returncode
 
 
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def sanitize_run_name(value: str) -> str:
+    lowered = value.lower().strip()
+    if not lowered:
+        return "pilot-run"
+    return re.sub(r"[^a-z0-9._-]+", "-", lowered).strip("-") or "pilot-run"
+
+
+def detect_kept_kinds(preprocess_config: dict[str, Any]) -> list[str]:
+    output_dir_value = preprocess_config.get("output_dir")
+    if not output_dir_value:
+        return []
+
+    output_root = Path(output_dir_value)
+    if not output_root.is_absolute():
+        output_root = PROJECT_ROOT / output_root
+
+    manifest_path = output_root / "manifests" / "sections.json"
+    if not manifest_path.exists():
+        return []
+
+    manifest = load_json(manifest_path)
+    sections = manifest.get("sections", [])
+    kinds: list[str] = []
+    for section in sections:
+        if not section.get("keep_in_clean"):
+            continue
+        kind = str(section.get("kind") or "").strip()
+        if not kind:
+            continue
+        if kind == "front_matter":
+            continue
+        if kind not in kinds:
+            kinds.append(kind)
+
+    if kinds:
+        return kinds
+
+    # Fallback: keep front_matter if that is all we have.
+    for section in sections:
+        if not section.get("keep_in_clean"):
+            continue
+        kind = str(section.get("kind") or "").strip()
+        if kind and kind not in kinds:
+            kinds.append(kind)
+    return kinds
+
+
+def select_existing_kinds(preprocess_config: dict[str, Any], preferred_kinds: list[str] | None) -> list[str]:
+    """Return kinds that exist in the preprocess manifest while preserving order.
+
+    If preferred_kinds does not match anything, return detected kept kinds.
+    """
+    detected = detect_kept_kinds(preprocess_config)
+    if not detected:
+        return []
+
+    if not preferred_kinds:
+        return detected
+
+    detected_set = set(detected)
+    matched = [kind for kind in preferred_kinds if kind in detected_set]
+    if matched:
+        return matched
+    return detected
+
+
+def ensure_related_configs(preprocess_config_path: Path) -> None:
+    preprocess_payload = load_json(preprocess_config_path)
+    work_id = str(preprocess_payload.get("work_id") or "").strip()
+    source_file = str(preprocess_payload.get("source_file") or "").strip()
+    if not work_id:
+        print("\n[자동 생성] work_id를 찾지 못해 glossary/pilot 설정 생성을 건너뜁니다.")
+        return
+
+    created_files: list[Path] = []
+    kept_kinds = detect_kept_kinds(preprocess_payload)
+
+    glossary_template_path = GLOSSARY_DIR / "template.json"
+    glossary_output_path = GLOSSARY_DIR / f"{work_id}.json"
+    if glossary_template_path.exists() and not glossary_output_path.exists():
+        glossary_payload = load_json(glossary_template_path)
+        glossary_payload["work_id"] = work_id
+        if source_file:
+            glossary_payload["source_file"] = source_file
+        write_json(glossary_output_path, glossary_payload)
+        created_files.append(glossary_output_path)
+
+    for template_path in sorted(PILOT_CONFIG_DIR.glob("template*.json")):
+        suffix = template_path.name[len("template") :]
+        output_path = PILOT_CONFIG_DIR / f"{work_id}{suffix}"
+        if output_path.exists():
+            continue
+
+        pilot_payload = load_json(template_path)
+        pilot_payload["work_id"] = work_id
+        pilot_payload["preprocess_config"] = f"configs/{preprocess_config_path.name}"
+        pilot_payload["glossary_file"] = f"glossaries/{work_id}.json"
+        pilot_payload["output_dir"] = f"artifacts/{work_id}/runs"
+
+        model_name = str(pilot_payload.get("model", {}).get("model") or "")
+        pilot_payload["run_name"] = sanitize_run_name(model_name)
+
+        if kept_kinds:
+            selection = pilot_payload.setdefault("selection", {})
+            if isinstance(selection, dict):
+                selection["kinds"] = kept_kinds
+
+        write_json(output_path, pilot_payload)
+        created_files.append(output_path)
+
+    print("\n[자동 생성] glossary/pilot 설정 점검 완료")
+    if not created_files:
+        print("  - 새로 생성된 파일 없음 (이미 존재)")
+        return
+    for created in created_files:
+        rel_path = created.relative_to(PROJECT_ROOT).as_posix()
+        print(f"  - 생성됨: {rel_path}")
+
+
 def list_config_files(directory: Path) -> list[Path]:
     return sorted(directory.glob("*.json"))
+
+
+def get_pilot_config_display_names(config_paths: list[Path]) -> list[str]:
+    display_names: list[str] = []
+    for config_path in config_paths:
+        try:
+            payload = load_json(config_path)
+            model = payload.get("model", {}) if isinstance(payload, dict) else {}
+            provider = str(model.get("provider") or "unknown-provider")
+            model_name = str(model.get("model") or "unknown-model")
+            display_names.append(f"{config_path.name} ({provider} / {model_name})")
+        except Exception:
+            display_names.append(f"{config_path.name} (읽기 실패)")
+    return display_names
+
+
+def filter_ai_draft_pilot_configs(config_paths: list[Path]) -> tuple[list[Path], str | None]:
+    """Prefer configs that are immediately executable for AI draft generation.
+
+    A config is considered ready when model.api_key_env exists and is already set
+    in the current environment. If none are ready, return the original list.
+    """
+    ready_configs: list[Path] = []
+    for config_path in config_paths:
+        try:
+            payload = load_json(config_path)
+        except Exception:
+            continue
+        model = payload.get("model", {}) if isinstance(payload, dict) else {}
+        key_name = str(model.get("api_key_env") or "").strip()
+        if key_name and os.getenv(key_name):
+            ready_configs.append(config_path)
+
+    if ready_configs:
+        return ready_configs, "API 키가 설정된 설정만 표시합니다."
+
+    return config_paths, "설정된 API 키가 없어 전체 설정을 표시합니다."
 
 
 def list_run_directories() -> list[Path]:
@@ -117,6 +299,222 @@ def resolve_run_output_dir(payload: dict) -> Path | None:
     if not output_root.is_absolute():
         output_root = PROJECT_ROOT / output_root
     return output_root / run_name
+
+
+def resolve_project_path(path_text: str) -> Path:
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
+
+
+def strip_code_fence(text: str) -> str:
+    fenced = text.strip()
+    if fenced.startswith("```"):
+        lines = fenced.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return fenced
+
+
+def parse_json_from_model_text(text: str) -> dict[str, Any]:
+    normalized = strip_code_fence(text)
+    try:
+        return json.loads(normalized)
+    except json.JSONDecodeError:
+        pass
+
+    start = normalized.find("{")
+    end = normalized.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError("모델 응답에서 JSON 객체를 찾지 못했습니다.")
+
+    return json.loads(normalized[start : end + 1])
+
+
+def run_generate_glossary_ai_draft() -> None:
+    pilot_configs = [p for p in list_config_files(PILOT_CONFIG_DIR) if not p.name.startswith("template")]
+    pilot_configs, filter_message = filter_ai_draft_pilot_configs(pilot_configs)
+    if filter_message:
+        print(f"\n{filter_message}")
+    display_names = get_pilot_config_display_names(pilot_configs)
+    selected = choose_from_list(
+        "\n[용어집 AI 초안 생성] 파일럿 설정 파일을 선택하세요.",
+        pilot_configs,
+        display_names,
+    )
+    if selected is None:
+        return
+
+    config = load_json(selected)
+    model_config = config.get("model", {})
+    key_name = model_config.get("api_key_env")
+    if key_name and not os.getenv(key_name):
+        print(f"\n환경변수 {key_name} 가 설정되어 있지 않습니다.")
+        key_value = getpass("API 키를 입력하세요(현재 세션에만 적용, 입력값 숨김): ").strip()
+        if not key_value:
+            print("API 키가 비어 있어 생성을 취소했습니다.")
+            return
+        os.environ[key_name] = key_value
+
+    preprocess_config_value = str(config.get("preprocess_config") or "").strip()
+    if not preprocess_config_value:
+        print("\npilot 설정에 preprocess_config 값이 없어 생성을 진행할 수 없습니다.")
+        return
+
+    preprocess_config_path = resolve_project_path(preprocess_config_value)
+    if not preprocess_config_path.exists() or not preprocess_config_path.is_file():
+        print(f"\n전처리 설정 파일을 찾을 수 없습니다: {preprocess_config_path}")
+        return
+
+    try:
+        preprocess_config = load_json(preprocess_config_path)
+    except Exception as exc:
+        print(f"\n전처리 설정 파일을 읽는 중 오류가 발생했습니다: {exc}")
+        return
+    output_dir = resolve_project_path(str(preprocess_config.get("output_dir", "")))
+    manifest_path = output_dir / "manifests" / "sections.json"
+    cleaned_dir = output_dir / "cleaned_split"
+    if not manifest_path.exists() or not cleaned_dir.exists():
+        print("\n전처리 산출물이 없습니다. 먼저 1번(전처리 실행)을 수행하세요.")
+        return
+
+    manifest = load_json(manifest_path)
+    sections = [
+        s
+        for s in manifest.get("sections", [])
+        if s.get("keep_in_clean") and str(s.get("kind") or "") != "front_matter"
+    ]
+    default_sections = sections[:]
+    kinds = config.get("selection", {}).get("kinds")
+    if isinstance(kinds, list) and kinds:
+        allowed = {str(kind) for kind in kinds}
+        sections = [s for s in sections if str(s.get("kind")) in allowed]
+
+    if not sections and default_sections:
+        print(
+            "\n선택된 kinds로 샘플이 없어, keep_in_clean 섹션 전체(전면부 제외)로 자동 전환합니다."
+        )
+        sections = default_sections
+
+    if not sections:
+        print("\n샘플로 사용할 섹션이 없습니다. selection.kinds 또는 전처리 결과를 확인하세요.")
+        return
+
+    sample_count = prompt_optional_int("샘플 섹션 수를 입력하세요 (기본 2): ")
+    max_chars_per_section = prompt_optional_int("섹션당 최대 글자 수를 입력하세요 (기본 3500): ")
+    sample_count = sample_count if sample_count and sample_count > 0 else 2
+    max_chars_per_section = max_chars_per_section if max_chars_per_section and max_chars_per_section > 0 else 3500
+
+    sampled_sections = sections[:sample_count]
+    sampled_chunks: list[str] = []
+    used_labels: list[str] = []
+    for section in sampled_sections:
+        clean_file = section.get("clean_file")
+        if not clean_file:
+            continue
+        clean_path = cleaned_dir / str(clean_file)
+        if not clean_path.exists():
+            continue
+        text = clean_path.read_text(encoding="utf-8").strip()
+        if len(text) > max_chars_per_section:
+            text = text[:max_chars_per_section]
+        label = str(section.get("display_label") or section.get("title") or section.get("stable_id"))
+        used_labels.append(label)
+        sampled_chunks.append(
+            "\n".join(
+                [
+                    f"[section] stable_id={section.get('stable_id')} kind={section.get('kind')} title={label}",
+                    text,
+                ]
+            )
+        )
+
+    if not sampled_chunks:
+        print("\n샘플 텍스트를 읽지 못했습니다.")
+        return
+
+    work_id = str(preprocess_config.get("work_id") or "unknown-work")
+    source_file = str(preprocess_config.get("source_file") or "")
+    system_prompt = (
+        "You are a bilingual Korean-to-English literary translation glossary assistant. "
+        "Return strict JSON only with no markdown fences."
+    )
+    user_prompt = "\n".join(
+        [
+            "Create a draft glossary JSON from the sampled Korean novel text.",
+            "Output JSON object with exactly these top-level keys:",
+            "global_instructions, character_profiles, term_glossary, style_rules, do_not_translate, review_notes",
+            "Constraints:",
+            "- Keep arrays concise and practical for pilot translation.",
+            "- Use English for target names/terms.",
+            "- Include only terms supported by the sample text.",
+            "- character_profiles item keys: source_name,target_name,role,speech_style_notes,personality_notes,status",
+            "- term_glossary item keys: source_term,target_term,category,notes,status",
+            "- style_rules item keys: rule,reason",
+            "Sample text:",
+            "\n\n".join(sampled_chunks),
+        ]
+    )
+
+    print("\n[용어집 AI 초안 생성] 모델에 요청 중입니다...")
+    try:
+        provider = get_provider(model_config)
+        api_response, _attempts = call_model_api_with_retry(model_config, system_prompt, user_prompt)
+        model_text = extract_translation_text(api_response, provider)
+        generated = parse_json_from_model_text(model_text)
+    except Exception as exc:
+        print(f"\nAI 초안 생성 중 오류가 발생했습니다: {exc}")
+        print("설정을 확인한 뒤 다시 시도하세요.")
+        return
+
+    template_path = GLOSSARY_DIR / "template.json"
+    if template_path.exists():
+        draft_payload = load_json(template_path)
+    else:
+        draft_payload = {
+            "work_id": work_id,
+            "source_file": source_file,
+            "language_pair": {"source": "ko", "target": "en"},
+            "global_instructions": [],
+            "character_profiles": [],
+            "term_glossary": [],
+            "style_rules": [],
+            "do_not_translate": [],
+            "review_notes": [],
+        }
+
+    draft_payload["work_id"] = work_id
+    if source_file:
+        draft_payload["source_file"] = source_file
+
+    for key in [
+        "global_instructions",
+        "character_profiles",
+        "term_glossary",
+        "style_rules",
+        "do_not_translate",
+        "review_notes",
+    ]:
+        value = generated.get(key)
+        if isinstance(value, list):
+            draft_payload[key] = value
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    draft_payload.setdefault("review_notes", [])
+    if isinstance(draft_payload["review_notes"], list):
+        draft_payload["review_notes"].append(
+            f"AI draft generated at {timestamp}; sampled sections: {', '.join(used_labels)}"
+        )
+
+    output_path = GLOSSARY_DIR / f"{work_id}.ai-draft.json"
+    write_json(output_path, draft_payload)
+    print("\n[용어집 AI 초안 생성 결과]")
+    print(f"생성 파일: {output_path}")
+    print("기존 정식 용어집은 덮어쓰지 않았습니다. 검토 후 반영하세요.")
 
 
 def print_pilot_attempt_summary(selected: Path, payload: dict, execute: bool, resume: bool) -> None:
@@ -175,8 +573,7 @@ def print_pilot_result_summary(payload: dict, return_code: int) -> None:
 
 
 def show_preprocess_output_preview(config_path: Path) -> None:
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+    config = load_json(config_path)
 
     output_dir_value = config.get("output_dir")
     if not output_dir_value:
@@ -220,19 +617,56 @@ def run_preprocess() -> None:
     return_code = run_command(command)
     if return_code == 0:
         show_preprocess_output_preview(selected)
+        ensure_related_configs(selected)
     else:
         print(f"\n전처리 실행에 실패했습니다. 종료 코드: {return_code}")
 
 
 def run_pilot(execute: bool) -> None:
-    config_files = list_config_files(PILOT_CONFIG_DIR)
+    config_files = [p for p in list_config_files(PILOT_CONFIG_DIR) if not p.name.startswith("template")]
+    display_names = get_pilot_config_display_names(config_files)
     mode_text = "실행" if execute else "드라이런"
-    selected = choose_from_list(f"\n[파일럿 {mode_text}] 설정 파일을 선택하세요.", config_files)
+    selected = choose_from_list(
+        f"\n[파일럿 {mode_text}] 설정 파일을 선택하세요.",
+        config_files,
+        display_names,
+    )
     if selected is None:
         return
 
-    with selected.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_json(selected)
+    command_config_path = selected
+
+    preprocess_config_text = str(payload.get("preprocess_config") or "").strip()
+    selection = payload.get("selection", {})
+    preferred_kinds_raw = selection.get("kinds") if isinstance(selection, dict) else None
+    preferred_kinds = (
+        [str(kind) for kind in preferred_kinds_raw if str(kind).strip()]
+        if isinstance(preferred_kinds_raw, list)
+        else None
+    )
+
+    if preprocess_config_text:
+        preprocess_config_path = resolve_project_path(preprocess_config_text)
+        if preprocess_config_path.exists():
+            preprocess_config = load_json(preprocess_config_path)
+            effective_kinds = select_existing_kinds(preprocess_config, preferred_kinds)
+            if effective_kinds and effective_kinds != (preferred_kinds or []):
+                print(
+                    "\n선택된 kinds가 전처리 결과와 맞지 않아 "
+                    f"자동으로 kinds={effective_kinds} 로 조정합니다."
+                )
+                adjusted_payload = dict(payload)
+                adjusted_selection = dict(adjusted_payload.get("selection", {}))
+                adjusted_selection["kinds"] = effective_kinds
+                adjusted_payload["selection"] = adjusted_selection
+
+                temp_dir = PROJECT_ROOT / "artifacts" / "tmp-pilot-configs"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                temp_path = temp_dir / f"{selected.stem}.effective{selected.suffix}"
+                write_json(temp_path, adjusted_payload)
+                command_config_path = temp_path
+                payload = adjusted_payload
 
     env = os.environ.copy()
     resume_requested = False
@@ -250,7 +684,7 @@ def run_pilot(execute: bool) -> None:
     command = [
         "py",
         "scripts\\translate_pilot.py",
-        str(selected.relative_to(PROJECT_ROOT)).replace("/", "\\"),
+        str(command_config_path.relative_to(PROJECT_ROOT)).replace("/", "\\"),
         "--base-dir",
         str(PROJECT_ROOT),
     ]
@@ -302,9 +736,10 @@ def main() -> None:
         print(f"프로젝트 경로: {PROJECT_ROOT}")
         print()
         print("1. 전처리 실행")
-        print("2. 파일럿 드라이런 실행")
-        print("3. 파일럿 실제 실행 (--execute)")
-        print("4. 완성 화 추출 + 연속 병합")
+        print("2. 용어집 AI 초안 생성")
+        print("3. 파일럿 드라이런 실행")
+        print("4. 파일럿 실제 실행 (--execute)")
+        print("5. 완성 화 추출 + 연속 병합")
         print("0. 종료")
 
         choice = input("\n메뉴 번호를 입력하세요: ").strip()
@@ -313,12 +748,15 @@ def main() -> None:
             run_preprocess()
             pause()
         elif choice == "2":
-            run_pilot(execute=False)
+            run_generate_glossary_ai_draft()
             pause()
         elif choice == "3":
-            run_pilot(execute=True)
+            run_pilot(execute=False)
             pause()
         elif choice == "4":
+            run_pilot(execute=True)
+            pause()
+        elif choice == "5":
             run_extract_completed_sections()
             pause()
         elif choice == "0":

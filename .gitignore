@@ -38,6 +38,8 @@ configs/*.json
 pilot_configs/*.json
 !configs/template.json
 !pilot_configs/template.json
+configs/backup/
+pilot_configs/backup/
 
 # Per-novel glossary files (keep template example only)
 glossaries/*.json

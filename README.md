@@ -63,10 +63,13 @@ run-menu.cmd
 ```
 
 메뉴에서 전처리를 실행하면 완료 직후 raw_split/cleaned_split 파일 수와 파일명 샘플 5개를 자동으로 출력한다.
+메뉴 2번에서는 용어집 AI 초안(`glossaries/<work_id>.ai-draft.json`)을 생성한다.
+기존 정식 용어집 파일은 덮어쓰지 않는다.
+메뉴 3번은 파일럿 드라이런 실행이다.
 메뉴에서 파일럿 실제 실행을 선택하면 API 키 입력값은 화면에 표시되지 않는다.
 파일럿 실제 실행 메뉴에서는 기존 run_name 결과를 이어서 실행할지(`--resume`) 선택할 수 있다.
-메뉴 3번 실행은 `final_translated.txt` 생성을 건너뛴다 (`--skip-final-translated`).
-메뉴 4번에서는 완성 화 추출 스크립트를 실행하며 `--start-section`만 선택할 수 있다.
+메뉴 4번 실행은 `final_translated.txt` 생성을 건너뛴다 (`--skip-final-translated`).
+메뉴 5번에서는 완성 화 추출 스크립트를 실행하며 `--start-section`만 선택할 수 있다.
 빈 입력 시 0번 블록부터 끝까지 재생성한다.
 
 ### 1) 전처리
