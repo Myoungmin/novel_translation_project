@@ -53,14 +53,39 @@ def resolve_work_config_path(run_dir: Path) -> tuple[Path | None, dict[str, Any]
     if not work_id or not workspace_root:
         return None, None
 
-    config_path = workspace_root / "configs" / f"{work_id}.json"
-    if not config_path.exists() or not config_path.is_file():
-        return None, None
+    config_dir = workspace_root / "configs"
 
-    try:
-        return config_path, json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return config_path, None
+    # Prefer direct filename match, but accept common slug variants.
+    name_candidates = [
+        f"{work_id}.json",
+        f"{work_id.replace('-', '_')}.json",
+        f"{work_id.replace('_', '-')}.json",
+    ]
+    seen: set[str] = set()
+    for name in name_candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        config_path = config_dir / name
+        if not config_path.exists() or not config_path.is_file():
+            continue
+        try:
+            return config_path, json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return config_path, None
+
+    # Fallback: locate config by internal work_id field.
+    for config_path in sorted(config_dir.glob("*.json")):
+        if config_path.name.startswith("template"):
+            continue
+        try:
+            config_data = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(config_data.get("work_id") or "").strip() == work_id:
+            return config_path, config_data
+
+    return None, None
 
 
 def resolve_preprocess_output_dir(run_dir: Path) -> Path | None:
