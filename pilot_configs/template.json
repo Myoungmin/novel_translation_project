@@ -20,6 +20,6 @@
   },
   "selection": {
     "kinds": ["chapter"],
-    "limit": 3
+    "limit": 1000
   }
 }

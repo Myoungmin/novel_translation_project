@@ -6,7 +6,7 @@
   "clean_exclude_types": ["afterword"],
   "html_output": {
     "enabled": true,
-    "split_size": 30000,
+    "split_size": 300000,
     "_comment": "split_size 설정: 숫자(글자수) 또는 프리셋('light', 'medium', 'heavy')",
     "_presets": "light=15000 / medium=30000 / heavy=50000"
   },
