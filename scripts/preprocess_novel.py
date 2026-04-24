@@ -123,6 +123,14 @@ def read_source_text(source_path: Path, encodings: list[str]) -> tuple[str, str]
         except UnicodeDecodeError as error:
             last_error = error
 
+    # Some legacy source files contain a few broken bytes mixed into an otherwise
+    # consistent encoding. Fall back to replacement so preprocessing can continue.
+    for encoding in encodings:
+        try:
+            return source_path.read_text(encoding=encoding, errors="replace"), f"{encoding} (replace)"
+        except UnicodeDecodeError:
+            continue
+
     encodings_text = ", ".join(encodings)
     raise RuntimeError(
         f"Unable to decode {source_path} with the configured encodings: {encodings_text}"
